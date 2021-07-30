@@ -82,7 +82,8 @@ class ClientWindow(QMainWindow):
             self.video_player.setPixmap(pix)
 
     def handle_setup(self):
-        self._media_client.establish_rtsp_connection()
+        #self._media_client.establish_rtsp_connection()
+        #self._media_client.send_describe_request()
         self._media_client.send_setup_request()
         self.setup_button.setEnabled(False)
         self.play_button.setEnabled(True)

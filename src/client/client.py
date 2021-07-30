@@ -4,6 +4,7 @@ from typing import Union, Optional, List, Tuple
 from time import sleep
 from PIL import Image
 from io import BytesIO
+import hashlib
 
 from utils.rtsp_packet import RTSPPacket
 from utils.rtp_packet import RTPPacket
@@ -14,7 +15,7 @@ class Client:
     DEFAULT_CHUNK_SIZE = 4096
     DEFAULT_RECV_DELAY = 20  # in milliseconds
 
-    DEFAULT_LOCAL_HOST = '127.0.0.1'
+    DEFAULT_LOCAL_HOST = '0.0.0.0'
 
     RTP_SOFT_TIMEOUT = 5  # in milliseconds
     # for allowing simulated non-blocking operations
@@ -26,23 +27,34 @@ class Client:
 
     def __init__(
             self,
-            file_path: str,
+            host_file_path: str,
             remote_host_address: str,
             remote_host_port: int,
-            rtp_port: int):
+            rtp_port: int,
+            user: str = None,
+            pw: str = None,
+            user_agent: str = "RTSP Client"):
         self._rtsp_connection: Union[None, socket.socket] = None
         self._rtp_socket: Union[None, socket.socket] = None
         self._rtp_receive_thread: Union[None, Thread] = None
         self._frame_buffer: List[Image.Image] = []
         self._current_sequence_number = 0
         self.session_id = ''
+        self._user_agent = user_agent
+
+        # Used for Authentication
+        self._user = user
+        self._pw = pw
+        self.realm = None
+        self.nounce = None
+        self.need_auth = False
 
         self.current_frame_number = -1
 
         self.is_rtsp_connected = False
         self.is_receiving_rtp = False
 
-        self.file_path = file_path
+        self.host_file_path = host_file_path
         self.remote_host_address = remote_host_address
         self.remote_host_port = remote_host_port
         self.rtp_port = rtp_port
@@ -65,6 +77,7 @@ class Client:
         recv = bytes()
         print('Waiting RTP packet...')
         while True:
+            print("Trying to receive")
             try:
                 recv += self._rtp_socket.recv(size)
                 if recv.endswith(VideoStream.JPEG_EOF):
@@ -108,20 +121,59 @@ class Client:
         self._rtsp_connection.close()
         self.is_rtsp_connected = False
 
+    def _generate_auth_string(self, username, password, realm, method, uri, nonce):
+        m1 = bytes(hashlib.md5(bytes(username, 'utf-8') + bytes(":", 'utf-8') + bytes(realm, 'utf-8') + bytes(":", 'utf-8') + bytes(password, 'utf-8')).hexdigest(), 'utf-8')
+        m2 = bytes(hashlib.md5(bytes(method, 'utf-8') + bytes(":", 'utf-8') + bytes(uri, 'utf-8')).hexdigest(), 'utf-8')
+        response = hashlib.md5(m1 + bytes(":", 'utf-8') + bytes(nonce, 'utf-8') + bytes(":", 'utf-8') + m2).hexdigest()
+        ret_auth = "Digest "
+        ret_auth += "username=\"" + username+ "\", "
+        ret_auth += "realm=\"" + realm + "\", "
+        ret_auth += "algorithm=\"MD5\", "
+        ret_auth += "nonce=\"" + nonce + "\", "
+        ret_auth += "response=\"" + response + "\""
+        return ret_auth
+
     def _send_request(self, request_type=RTSPPacket.INVALID) -> RTSPPacket:
         if not self.is_rtsp_connected:
             raise Exception('rtsp connection not established. run `setup_rtsp_connection()`')
+
+        auth_seq = None
+        if self.need_auth:
+            auth_seq = self._generate_auth_string(self._user, self._pw, self.realm, request_type, '', self.nonce)
+
+        rtsp_host_to_send =  self.remote_host_address + "/" + self.host_file_path if request_type == RTSPPacket.SETUP else self.remote_host_address
+
         request = RTSPPacket(
             request_type,
-            self.file_path,
+            self._user_agent,
+            rtsp_host_to_send,
             self._current_sequence_number,
             self.rtp_port,
-            self.session_id
+            self.session_id, 
+            auth_seq
         ).to_request()
         print(f"Sending request: {repr(request)}")
         self._rtsp_connection.send(request)
         self._current_sequence_number += 1
         return self._get_response()
+
+    def send_describe_and_authenticate_request(self) -> RTSPPacket:
+        response = self._send_request(RTSPPacket.DESCRIBE)
+
+        # Only Digest is supported
+        if response.authentication_method == "Digest":
+            if not self._user and not self._pw:
+                print('\nServer needs authentication info.')
+                return
+            self.need_auth = True
+            self.realm = response.realm
+            self.nonce = response.nonce
+
+            response = self._send_request(RTSPPacket.DESCRIBE)
+            if response.status_code != 200:
+                print('\nAuthentication failed.')
+                return
+        return response
 
     def send_setup_request(self) -> RTSPPacket:
         response = self._send_request(RTSPPacket.SETUP)
